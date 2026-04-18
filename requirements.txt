@@ -1,0 +1,19 @@
+# ═══════════════════════════════════════════════════════════════
+#  OSPREY × DAEMON NIDS — Python Dependencies
+#  Target: Ubuntu 24.04 LTS (Noble Numbat) + Python 3.10+
+#  System prereqs: sudo apt install libpcap-dev build-essential
+# ═══════════════════════════════════════════════════════════════
+
+# ── Core ML inference ─────────────────────────────────────────
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.2.0
+numpy>=1.26.0
+pandas>=2.1.0
+scipy>=1.12.0
+scikit-learn>=1.4.0
+
+# ── Live packet capture ──────────────────────────────────────
+scapy>=2.5.0              # Real-time packet sniffing + CICFlowMeter replica
+
+# ── Web dashboard ────────────────────────────────────────────
+flask>=3.0.0              # Required for: sudo python3 nids_web.py
