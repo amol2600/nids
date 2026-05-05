@@ -135,7 +135,10 @@ class InferenceEngine:
         b["daemon_threshold"] = _DAEMON_OVERRIDE
 
         if _HAS_POSTCLASS:
-            self.ddos_aggregator = DDoSAggregator(window_sec=120, min_sources=3)
+            self.ddos_aggregator = DDoSAggregator(
+                window_sec=120, min_sources=3,
+                excluded_ports={53},
+            )
         else:
             self.ddos_aggregator = None
 
@@ -187,26 +190,57 @@ class InferenceEngine:
 
         osprey_results_map = {}
         if anomaly_indices:
-            of = b["osprey_feature_names"]
-            oX_df = self._align_to_scaler(eng_df, b["osprey_scaler"])
-            oX_scaled = pd.DataFrame(
-                b["osprey_scaler"].transform(oX_df),
-                columns=oX_df.columns, index=oX_df.index,
-            ).astype(np.float32)
+            # ── Minimum-packet gate ──────────────────────────────
+            # Flows with <5 fwd packets produce unreliable OSPREY
+            # classifications (coin-flip at ≤3 fwd_pkts per R27 data).
+            # Force UNKNOWN for these — DAEMON already flagged the attack.
+            _MIN_PKTS = 3  # R29-tuned: was 5, lowered to preserve DoS accuracy
+            _UNKNOWN_SYNTHETIC = {
+                'osprey_verdict': 'UNKNOWN',
+                'osprey_class': 'UNKNOWN',
+                'osprey_predicted_class': 'UNKNOWN',
+                'osprey_energy': float('nan'),
+                'osprey_entropy': float('nan'),
+                'osprey_max_cos': float('nan'),
+                'osprey_ood_count': 3,
+            }
 
-            for col in of:
-                if col not in oX_scaled.columns:
-                    oX_scaled[col] = 0.0
+            # Split: indices with enough packets vs too few
+            osprey_eligible = []
+            for idx in anomaly_indices:
+                fwd_pkts = 0
+                if 'total_fwd_packets' in raw_df.columns:
+                    try:
+                        fwd_pkts = int(raw_df.iloc[idx].get('total_fwd_packets', 0))
+                    except (ValueError, TypeError):
+                        fwd_pkts = 0
+                if fwd_pkts < _MIN_PKTS:
+                    osprey_results_map[idx] = dict(_UNKNOWN_SYNTHETIC)
+                else:
+                    osprey_eligible.append(idx)
 
-            oX_anomaly = oX_scaled.iloc[anomaly_indices][of].values
+            # Run OSPREY only on eligible flows
+            if osprey_eligible:
+                of = b["osprey_feature_names"]
+                oX_df = self._align_to_scaler(eng_df, b["osprey_scaler"])
+                oX_scaled = pd.DataFrame(
+                    b["osprey_scaler"].transform(oX_df),
+                    columns=oX_df.columns, index=oX_df.index,
+                ).astype(np.float32)
 
-            o_res = run_osprey(
-                self.osprey_model, oX_anomaly,
-                b["osprey_thresholds"], b["osprey_label_encoder"],
-            )
+                for col in of:
+                    if col not in oX_scaled.columns:
+                        oX_scaled[col] = 0.0
 
-            for orig_idx, osp_result in zip(anomaly_indices, o_res):
-                osprey_results_map[orig_idx] = osp_result
+                oX_anomaly = oX_scaled.iloc[osprey_eligible][of].values
+
+                o_res = run_osprey(
+                    self.osprey_model, oX_anomaly,
+                    b["osprey_thresholds"], b["osprey_label_encoder"],
+                )
+
+                for orig_idx, osp_result in zip(osprey_eligible, o_res):
+                    osprey_results_map[orig_idx] = osp_result
 
         results = cascade_verdict(d_res, osprey_results_map)
 
@@ -237,8 +271,6 @@ class InferenceEngine:
                         r["cascade_class"] = new_class
                         r["cascade_verdict"] = f"ATTACK: {new_class}"
                         r["postclass_override"] = f"DDoS rule: {original_class} -> {new_class}"
-
-
 
         return results
 
@@ -314,9 +346,7 @@ _csv_lock = threading.Lock()
 # Bounded queue: drop flows rather than growing unbounded under flood.
 # At flood rates (50k+ pps) an unbounded queue makes the export worker
 # fall behind forever and keeps the GIL saturated servicing queue puts.
-# R24 fix: increased from 8000 to 32000 to capture more DDoS-LOIC flows
-# (R24 only captured 2 out of thousands due to queue overflow).
-_EXPORT_QUEUE_MAXSIZE = 32000
+_EXPORT_QUEUE_MAXSIZE = 8000
 _export_queue: queue.Queue = queue.Queue(maxsize=_EXPORT_QUEUE_MAXSIZE)
 _dropped_flows = 0          # flows dropped due to full queue (flood protection)
 _dropped_lock = threading.Lock()
@@ -375,35 +405,28 @@ def export_flow(flow, local_ips: set, engine: InferenceEngine):
         verdict = r["cascade_verdict"]
         cascade_class = r.get("cascade_class", "?")
 
-        # ── Helper: is IP on the same subnet as the local machine? ──
-        # Attack responses (target:80 → attacker) have dst on the LAN.
-        # Outbound system traffic (target → 91.189.x.x) goes to WAN.
-        # We only want to bypass WAN-bound traffic, not LAN responses.
-        def _is_lan_ip(ip_str):
-            """Return True if ip is on the same /24 as any local IP."""
-            try:
-                parts = ip_str.split('.')
-                if len(parts) != 4:
-                    return False
-                prefix = '.'.join(parts[:3])
-                for lip in local_ips:
-                    lparts = lip.split('.')
-                    if len(lparts) == 4 and '.'.join(lparts[:3]) == prefix:
-                        return True
-            except Exception:
-                pass
-            return False
-
         # ── Outbound traffic bypass ────────────────────────────────
         # Normal system traffic (DNS, NTP, HTTPS, apt, etc.) from this
         # host to external servers gets flagged as UNKNOWN/DoS by OSPREY.
-        # Override to BENIGN if traffic is OUTBOUND (src = this machine)
-        # AND destination is NOT on the local subnet (i.e. truly external).
-        # R26 fix: exclude LAN destinations — attack response flows
-        # (target:80 → attacker) were being classified BENIGN because
-        # src=target is in local_ips. 3,200+ attack responses lost in R25.
+        # Override to BENIGN if traffic is OUTBOUND (src = this machine).
+        # Inbound attacks have src = attacker IP, so they won't match.
+        if cascade_class in ("UNKNOWN", "DoS"):
+            if src in local_ips:
+                r["cascade_verdict"] = "\U0001f7e2 BENIGN"
+                r["cascade_class"] = "BENIGN"
+                verdict = r["cascade_verdict"]
+                cascade_class = "BENIGN"
+
+        # ── R38 fix: Orphan server-response bypass ────────────────
+        # When a forward flow (attacker→target:80) expires/FINs before
+        # late response packets arrive, those packets create a NEW flow
+        # with src=target:80, dst=attacker. These orphan response flows
+        # get misclassified as DoS (2,269 false positives in R38).
+        # Fix: if src is local AND src_port is a server port, this is
+        # always a server response — never an attack.
+        _SERVER_RESPONSE_PORTS = {80, 443, 8080, 8443}
         if cascade_class in ("UNKNOWN", "DoS", "DDoS"):
-            if src in local_ips and not _is_lan_ip(dst):
+            if src in local_ips and flow.src_port in _SERVER_RESPONSE_PORTS:
                 r["cascade_verdict"] = "\U0001f7e2 BENIGN"
                 r["cascade_class"] = "BENIGN"
                 verdict = r["cascade_verdict"]
@@ -414,17 +437,18 @@ def export_flow(flow, local_ips: set, engine: InferenceEngine):
         # server (HTTPS, DNS, etc.), response flows are keyed as:
         #   external_ip:443 → local_ip
         # The outbound bypass above misses these because src is external.
-        # Only apply for truly external sources (not LAN IPs that could
-        # be attackers using well-known source ports).
+        # Real DoS/DDoS attacks never originate from src_port 443/80/53
+        # — attackers use high ephemeral ports. So if src_port is a
+        # well-known service port and dst is local, it is response traffic.
         _SERVICE_PORTS = {
-            443, 53, 123, 8443,              # HTTPS, DNS, NTP (NOT 80!)
+            80, 443, 53, 123, 8080, 8443,   # HTTP, HTTPS, DNS, NTP
             993, 995, 587, 465, 25,          # mail
             67, 68, 546, 547,               # DHCP
             110, 143,                        # POP3, IMAP
         }
-        if cascade_class in ("UNKNOWN", "DoS", "DDoS"):
+        if cascade_class in ("UNKNOWN", "DoS"):
             if dst in local_ips and src not in local_ips:
-                if flow.src_port in _SERVICE_PORTS and not _is_lan_ip(src):
+                if flow.src_port in _SERVICE_PORTS:
                     r["cascade_verdict"] = "\U0001f7e2 BENIGN"
                     r["cascade_class"] = "BENIGN"
                     verdict = r["cascade_verdict"]
@@ -488,7 +512,12 @@ def export_flow(flow, local_ips: set, engine: InferenceEngine):
             row["src_port"] = int(flow.src_port)
             row["dst_ip"] = dst
             row["dst_port"] = int(flow.dst_port)
-            row["timestamp"] = datetime.now().isoformat()
+            # R36 fix: use flow start time (first packet), not export time,
+            # so post-run analysis scripts can correctly match flows to
+            # attack windows. datetime.now() caused 5-6 min skew for
+            # long-lived/delayed flows (e.g. DDoS-LOIC spoofed sources).
+            row["timestamp"] = datetime.fromtimestamp(
+                flow.start_time).isoformat()
             row["cascade_class"] = cascade_class
             row["cascade_verdict"] = verdict
             row["daemon_verdict"] = r.get("daemon_verdict", "")
@@ -541,38 +570,26 @@ def _enqueue_flow(flow):
         with _dropped_lock:
             _dropped_flows += 1
 
+SNAPSHOT_INTERVAL = 30.0
+SNAPSHOT_MIN_AGE = 10.0
+SNAPSHOT_MIN_PKTS = 3
 
 def _should_snapshot(flow, now: float) -> bool:
-    """Check if a long-lived flow should be periodically classified.
-
-    Matches standalone realtime_cicflow.py logic exactly:
-    - Flow must be at least SNAPSHOT_MIN_AGE seconds old
-    - Flow must have at least SNAPSHOT_MIN_PKTS packets
-    - At least SNAPSHOT_INTERVAL seconds since last snapshot
-    """
-    from realtime_cicflow import (
-        SNAPSHOT_INTERVAL, SNAPSHOT_MIN_AGE, SNAPSHOT_MIN_PKTS,
-    )
     age = now - flow.start_time
-    if age < SNAPSHOT_MIN_AGE:
-        return False
-    if len(flow.all_pkts) < SNAPSHOT_MIN_PKTS:
-        return False
-    since_last = now - flow._last_snapshot_time if flow._last_snapshot_time > 0 else age
+    if age < SNAPSHOT_MIN_AGE: return False
+    if len(flow.all_pkts) < SNAPSHOT_MIN_PKTS: return False
+    last = getattr(flow, '_last_snapshot_time', 0.0)
+    since_last = now - last if last > 0 else age
     return since_last >= SNAPSHOT_INTERVAL
-
 
 def capture_worker(iface: str, engine: InferenceEngine):
     """Background thread: Scapy capture + flow assembly."""
     local_ips = get_local_ips()
 
     try:
-        import copy
         from realtime_cicflow import (
             FlowRecord, PacketInfo, extract_features,
             _make_flow_key, FLOW_TIMEOUT,
-            IDLE_CLEANUP_TIMEOUT,
-            SNAPSHOT_INTERVAL, SNAPSHOT_MIN_AGE, SNAPSHOT_MIN_PKTS,
         )
         from scapy.sendrecv import AsyncSniffer
         from scapy.all import IP, TCP, UDP
@@ -581,7 +598,7 @@ def capture_worker(iface: str, engine: InferenceEngine):
 
         flows = {}
         flow_lock = threading.Lock()
-        IDLE_TIMEOUT = IDLE_CLEANUP_TIMEOUT  # 120s — match CICFlowMeter
+        IDLE_TIMEOUT = 120.0
 
         # Start pool of export worker threads (ML inference off the callback)
         export_threads = []
@@ -663,68 +680,36 @@ def capture_worker(iface: str, engine: InferenceEngine):
                         direction=direction, tcp_flags=flags,
                         tcp_window=win_size, payload_len=payload_len,
                     )
+                    flow.add_packet(pinfo)
 
-                    # ── CICFlowMeter-faithful flow termination ─────────────────
-                    # Matches realtime_cicflow.py (standalone) which replicates
-                    # CICFlowMeter Java exactly.  The old web UI code exported on
-                    # the FIRST FIN/RST from either direction, which split flows
-                    # in half and produced truncated features that OSPREY could
-                    # not classify correctly.
-
-                    # 1. Absolute timeout from flow start (120s)
-                    if flow.is_expired_absolute(now):
-                        if len(flow.all_pkts) > 1:
-                            _enqueue_flow(flows.pop(key))
-                        else:
-                            flows.pop(key, None)
-                        # Start new flow with this packet
-                        new_flow = FlowRecord(
-                            src_ip=flow.src_ip, dst_ip=flow.dst_ip,
-                            src_port=flow.src_port, dst_port=flow.dst_port,
-                            proto=flow.proto, start_time=now, last_seen=now,
-                        )
-                        new_flow.add_packet(pinfo)
-                        flows[key] = new_flow
-                        return
-
-                    # 2. Dual-FIN termination (CICFlowMeter: both dirs must FIN)
-                    if proto == 6 and (flags & 0x01):  # FIN flag
+                    # ── Ported Fix 3: Dual-FIN termination ──────────────────
+                    if proto == 6 and (flags & 0x01):  # FIN
                         if direction == 0:
                             flow.fwd_fin_cnt += 1
-                            if flow.fwd_fin_cnt == 1:
-                                if (flow.fwd_fin_cnt + flow.bwd_fin_cnt) >= 2:
-                                    flow.add_packet(pinfo)
-                                    _enqueue_flow(flows.pop(key))
-                                    return
-                                else:
-                                    flow.add_packet(pinfo)
-                                    return
                         else:
                             flow.bwd_fin_cnt += 1
-                            if flow.bwd_fin_cnt == 1:
-                                if (flow.fwd_fin_cnt + flow.bwd_fin_cnt) >= 2:
-                                    flow.add_packet(pinfo)
-                                    _enqueue_flow(flows.pop(key))
-                                    return
-                                else:
-                                    flow.add_packet(pinfo)
-                                    return
+                        
+                        if flow.fwd_fin_cnt > 0 and (flow.fwd_fin_cnt + flow.bwd_fin_cnt) >= 2:
+                            _enqueue_flow(flows.pop(key))
+                            return
+                        else:
+                            return
 
-                    # 3. RST → immediately export (CICFlowMeter: hasFlagRST)
-                    if proto == 6 and (flags & 0x04):  # RST flag
-                        flow.add_packet(pinfo)
+                    # RST immediately exports
+                    if proto == 6 and (flags & 0x04):  # RST
                         _enqueue_flow(flows.pop(key))
                         return
-
-                    # 4. Post-FIN packet filtering (CICFlowMeter behavior)
+                    
+                    # Normal packet — check if flow is already closed
                     if proto == 6:
-                        if direction == 0 and flow.fwd_fin_cnt > 0:
-                            return  # forward already sent FIN
-                        if direction == 1 and flow.bwd_fin_cnt > 0:
-                            return  # backward already sent FIN
+                        if direction == 0 and flow.fwd_fin_cnt > 0: return
+                        if direction == 1 and flow.bwd_fin_cnt > 0: return
 
-                    # 5. Normal packet — add to flow
-                    flow.add_packet(pinfo)
+                    # ── FIX: NO expired-flow scan here ────────────────────────────
+                    # REMOVED: the O(n) scan of all flows that previously ran on
+                    # EVERY packet. Under DoS/DDoS floods this was scanning thousands
+                    # of entries per packet. The background loop (every 2s) now owns
+                    # all expiry exclusively, keeping this callback O(1).
 
             except Exception as e:
                 STATE.add_alert(f"PKT ERROR: {e}")
@@ -751,7 +736,7 @@ def capture_worker(iface: str, engine: InferenceEngine):
 
         STATE.add_alert(f"Capture started on {iface} (BPF: {bpf})")
 
-        # Periodic flow export loop (owns ALL idle-timeout + absolute-timeout + snapshot expiry)
+        # Periodic flow export loop (owns ALL expiry and snapshots)
         try:
             while not STATE.stop_event.is_set():
                 time.sleep(2)
@@ -759,24 +744,23 @@ def capture_worker(iface: str, engine: InferenceEngine):
                     now = time.time()
                     expired_keys = []
                     snapshot_keys = []
-
+                    
                     for k, f in flows.items():
-                        # Check both absolute timeout AND idle timeout
-                        if f.is_expired_absolute(now) or (now - f.last_seen) > IDLE_TIMEOUT:
+                        if (now - f.last_seen) > IDLE_TIMEOUT or (now - f.start_time) > FLOW_TIMEOUT:
                             expired_keys.append(k)
-                        # Periodic snapshot for long-lived flows (Slowloris, etc.)
                         elif _should_snapshot(f, now):
                             snapshot_keys.append(k)
-
+                            
                     for k in expired_keys:
                         _enqueue_flow(flows.pop(k))
-
-                    # Snapshots: clone and classify without removing from table
+                        
                     for k in snapshot_keys:
                         f = flows[k]
                         f._last_snapshot_time = now
-                        f._snapshot_count += 1
+                        # Clone flow for snapshot evaluation (without removing from table)
+                        import copy
                         _enqueue_flow(copy.deepcopy(f))
+                        
         except Exception as e:
             STATE.add_alert(f"Capture error: {e}")
         finally:

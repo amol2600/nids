@@ -25,15 +25,25 @@ class DDoSAggregator:
         final_label = agg.classify(src_ip, dst_ip, dst_port, osprey_label)
     """
 
-    def __init__(self, window_sec=30, min_sources=3):
+    def __init__(self, window_sec=30, min_sources=3,
+                 excluded_ports=None, excluded_src_ips=None):
         """
         Args:
             window_sec: Time window to track source IPs (seconds)
             min_sources: Minimum unique source IPs hitting same target
                          to trigger DDoS upgrade
+            excluded_ports: Set of destination ports to SKIP for DDoS
+                            tracking (e.g. {53} for DNS). Flows on these
+                            ports pass through without aggregation.
+            excluded_src_ips: Set of source IPs to IGNORE when counting
+                              unique sources (e.g. gateway, target self-IP).
+                              These IPs are not counted toward min_sources
+                              and their own flows are never promoted.
         """
         self.window_sec = window_sec
         self.min_sources = min_sources
+        self.excluded_ports = excluded_ports or set()
+        self.excluded_src_ips = excluded_src_ips or set()
         # (dst_ip, dst_port) → [(timestamp, src_ip), ...]
         # Keyed per port so that unrelated services on the same host
         # (e.g. CDN flows on 443, DNS on 53) don't pollute the FTP/port-21 bucket.
@@ -61,6 +71,25 @@ class DDoSAggregator:
         Returns:
             Final label — either original or upgraded to "DDoS"
         """
+        try:
+            port = int(dst_port)
+        except (ValueError, TypeError):
+            port = 0
+
+        # R34 fix: Check excluded ports/IPs FIRST, before any label logic.
+        # OSPREY can directly output "DDoS" for DNS flows from trusted
+        # sources (e.g. gateway .1 on port 53). A single trusted source
+        # on an excluded port cannot be DDoS — downgrade to "DoS".
+        if port in self.excluded_ports:
+            if osprey_label == "DDoS":
+                return "DoS"
+            return osprey_label
+
+        if src_ip in self.excluded_src_ips:
+            if osprey_label == "DDoS":
+                return "DoS"
+            return osprey_label
+
         # Track DoS AND UNKNOWN flows for multi-source detection.
         # R26 fix: UNKNOWN flows from spoofed IPs were not counted,
         # causing 112/239 DDoS flows to be missed. OOD rejection at
@@ -68,11 +97,6 @@ class DDoSAggregator:
         # BENIGN and Brute Force have clear non-DDoS signals — skip them.
         if osprey_label not in ("DoS", "UNKNOWN"):
             return osprey_label
-
-        try:
-            port = int(dst_port)
-        except (ValueError, TypeError):
-            port = 0
 
         now = time.time()
         # Key per (dst_ip, dst_port) — prevents unrelated services on the same
@@ -86,9 +110,11 @@ class DDoSAggregator:
             # Clean old entries
             self._cleanup(key, now)
 
-            # Count unique sources hitting this target on this port
+            # Count unique sources hitting this target on this port,
+            # excluding any IPs in the exclusion list
             unique_sources = set(
                 src for _, src in self.dos_tracker[key]
+                if src not in self.excluded_src_ips
             )
 
             # Upgrade to DDoS if threshold met
