@@ -120,8 +120,8 @@ sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/<your-username>/osprey-nids.git
-cd osprey-nids
+git clone https://github.com/amol2600/nids.git
+cd nids
 
 # 2. Create virtual environment
 python3 -m venv venv
